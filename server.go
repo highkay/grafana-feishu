@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io/ioutil"
 	"log"
@@ -13,7 +14,18 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/basicauth"
 	"github.com/gofiber/fiber/v2/middleware/logger"
+	openai "github.com/sashabaranov/go-openai"
 )
+
+const systemPrompt = `你是经验丰富的SRE运维专家，请分析这个告警，并以飞书卡片能解析的Markdown格式返回，包含以下内容：
+
+### 故障分析
+[请在这里填写故障分析]
+
+### 处置建议
+[请在这里填写处置建议]
+
+请使用中文回复。`
 
 type Notification struct {
 	Alerts []Alert `json:"alerts"`
@@ -73,6 +85,14 @@ func main() {
 	if defaultBotUUID == "" {
 		log.Println("defaultUUID not provided")
 	}
+
+	openaiToken := os.Getenv("OPENAI_API_KEY")
+	openaiBaseURL := os.Getenv("OPENAI_BASE_URL")
+	openaiModelName := os.Getenv("OPENAI_MODEL_NAME")
+	if openaiModelName == "" {
+		openaiModelName = openai.GPT3Dot5Turbo
+	}
+
 	app := fiber.New()
 	app.Use(logger.New())
 
@@ -108,6 +128,34 @@ func main() {
 			if !ok {
 				description = "[No description]"
 			}
+
+			if openaiToken != "" {
+				config := openai.DefaultConfig(openaiToken)
+				if openaiBaseURL != "" {
+					config.BaseURL = openaiBaseURL
+				}
+				client := openai.NewClientWithConfig(config)
+				resp, err := client.CreateChatCompletion(
+					context.Background(),
+					openai.ChatCompletionRequest{
+						Model: openaiModelName,
+						Messages: []openai.ChatCompletionMessage{
+							{
+								Role:    openai.ChatMessageRoleSystem,
+								Content: systemPrompt,
+							},
+							{
+								Role:    openai.ChatMessageRoleUser,
+								Content: description,
+							},
+						},
+					},
+				)
+				if err == nil {
+					description = resp.Choices[0].Message.Content
+				}
+			}
+
 			color := "red"
 			if alert.Status == "resolved" {
 				color = "green"
@@ -126,7 +174,7 @@ func main() {
 						{
 							Tag: "div",
 							Text: FeishuCardTextElement{
-								Tag:     "plain_text",
+								Tag:     "lark_md",
 								Content: description,
 							},
 						},
