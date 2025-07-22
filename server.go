@@ -17,25 +17,53 @@ import (
 	openai "github.com/sashabaranov/go-openai"
 )
 
-const systemPrompt = `你是经验丰富的SRE运维专家，请分析这个告警，并以飞书卡片能解析的Markdown格式返回，包含以下内容：
+const systemPrompt = `作为一名经验丰富的SRE运维专家，请分析以下告警信息。以精简、清晰的Markdown格式（兼容飞书卡片）返回分析结果，必须包含以下部分：
 
 ### 故障分析
-[请在这里填写故障分析]
+- **告警摘要**: [一句话概括问题]
+- **可能原因**: [列出1-3个最可能的原因]
+- **影响范围**: [说明此问题可能造成的影响]
 
 ### 处置建议
-[请在这里填写处置建议]
+- **排查步骤**:
+  - [可直接执行的命令或检查步骤1]
+  - [可直接执行的命令或检查步骤2]
+- **恢复操作**:
+  - [用于恢复服务的命令]
+- **根本原因分析建议**:
+  - [定位根本原因的建议或命令]
 
-请使用中文回复。`
+请确保所有命令都包裹在 Markdown 代码块中以便复制执行。请使用中文回复。`
 
 type Notification struct {
-	Alerts []Alert `json:"alerts"`
+	Receiver          string            `json:"receiver"`
+	Status            string            `json:"status"`
+	OrgID             int               `json:"orgId"`
+	Alerts            []Alert           `json:"alerts"`
+	GroupLabels       map[string]string `json:"groupLabels"`
+	CommonLabels      map[string]string `json:"commonLabels"`
+	CommonAnnotations map[string]string `json:"commonAnnotations"`
+	ExternalURL       string            `json:"externalURL"`
+	Version           string            `json:"version"`
+	GroupKey          string            `json:"groupKey"`
+	TruncatedAlerts   int               `json:"truncatedAlerts"`
+	Title             string            `json:"title"`
+	State             string            `json:"state"`
+	Message           string            `json:"message"`
 }
 
 type Alert struct {
-	Status      string            `json:"status"`
-	Annotations map[string]string `json:"annotations"`
-	Labels      map[string]string `json:"labels"`
-	StartsAt    string            `json:"startsAt"`
+	Status       string            `json:"status"`
+	Labels       map[string]string `json:"labels"`
+	Annotations  map[string]string `json:"annotations"`
+	StartsAt     string            `json:"startsAt"`
+	EndsAt       string            `json:"endsAt"`
+	GeneratorURL string            `json:"generatorURL"`
+	Fingerprint  string            `json:"fingerprint"`
+	SilenceURL   string            `json:"silenceURL"`
+	DashboardURL string            `json:"dashboardURL"`
+	PanelURL     string            `json:"panelURL"`
+	Values       map[string]interface{} `json:"values"`
 }
 
 type FeishuCard struct {
@@ -113,90 +141,93 @@ func main() {
 		if err := c.BodyParser(notification); err != nil {
 			return err
 		}
-		if len(notification.Alerts) == 0 {
-			return nil
+
+		title, ok := notification.CommonAnnotations["summary"]
+		if !ok {
+			title = notification.Title
 		}
-		for _, alert := range notification.Alerts {
-			title, ok := alert.Annotations["summary"]
-			if !ok {
-				title, ok = alert.Labels["alertname"]
-				if !ok {
-					title = "[No Title]"
-				}
-			}
-			description, ok := alert.Annotations["description"]
-			if !ok {
-				description = "[No description]"
-			}
 
-			if openaiToken != "" {
-				config := openai.DefaultConfig(openaiToken)
-				if openaiBaseURL != "" {
-					config.BaseURL = openaiBaseURL
-				}
-				client := openai.NewClientWithConfig(config)
-				resp, err := client.CreateChatCompletion(
-					context.Background(),
-					openai.ChatCompletionRequest{
-						Model: openaiModelName,
-						Messages: []openai.ChatCompletionMessage{
-							{
-								Role:    openai.ChatMessageRoleSystem,
-								Content: systemPrompt,
-							},
-							{
-								Role:    openai.ChatMessageRoleUser,
-								Content: description,
-							},
-						},
-					},
-				)
-				if err == nil {
-					description = resp.Choices[0].Message.Content
-				}
-			}
+		description, ok := notification.CommonAnnotations["description"]
+		if !ok {
+			description = notification.Message
+		}
 
-			color := "red"
-			if alert.Status == "resolved" {
-				color = "green"
+		color := "red"
+		if notification.Status == "resolved" {
+			color = "green"
+		}
+
+		if openaiToken != "" {
+			log.Printf("Calling OpenAI API for more details...")
+			config := openai.DefaultConfig(openaiToken)
+			if openaiBaseURL != "" {
+				config.BaseURL = openaiBaseURL
 			}
-			feishuCard := &FeishuCard{
-				MsgType: "interactive",
-				Card: FeishuCardContent{
-					Header: FeishuCardHeader{
-						Title: FeishuCardTextElement{
-							Tag:     "plain_text",
-							Content: title,
-						},
-						Template: color,
-					},
-					Elements: []FeishuCardDivElement{
+			client := openai.NewClientWithConfig(config)
+			resp, err := client.CreateChatCompletion(
+				context.Background(),
+				openai.ChatCompletionRequest{
+					Model: openaiModelName,
+					Messages: []openai.ChatCompletionMessage{
 						{
-							Tag: "div",
-							Text: FeishuCardTextElement{
-								Tag:     "lark_md",
-								Content: description,
-							},
+							Role:    openai.ChatMessageRoleSystem,
+							Content: systemPrompt,
+						},
+						{
+							Role:    openai.ChatMessageRoleUser,
+							Content: description,
 						},
 					},
 				},
-			}
-			feishuJson, err := json.Marshal(feishuCard)
+			)
 			if err != nil {
-				return err
+				log.Printf("OpenAI API call failed: %v", err)
+				description = "OpenAI API call failed: " + err.Error()
+			} else {
+				description = strings.Trim(resp.Choices[0].Message.Content, "```markdown\n")
+				description = strings.Trim(description, "```")
+				log.Printf("Description from OpenAI: %s", description)
 			}
-			botUUID := c.Params("botUUID", defaultBotUUID)
-			feishuWebhookURL := feishuWebhookBase + "/" + botUUID
-			request, err := http.NewRequest("POST", feishuWebhookURL, bytes.NewBuffer(feishuJson))
-			request.Header.Set("Content-Type", "application/json; charset=UTF-8")
-			response, err := http.DefaultClient.Do(request)
-			if err != nil {
-				return err
-			}
-			defer response.Body.Close()
-			body, _ := ioutil.ReadAll(response.Body)
-			log.Printf("Response body: %s", string(body))
 		}
+
+		feishuCard := &FeishuCard{
+			MsgType: "interactive",
+			Card: FeishuCardContent{
+				Header: FeishuCardHeader{
+					Title: FeishuCardTextElement{
+						Tag:     "plain_text",
+						Content: title,
+					},
+					Template: color,
+				},
+				Elements: []FeishuCardDivElement{
+					{
+						Tag: "div",
+						Text: FeishuCardTextElement{
+							Tag:     "lark_md",
+							Content: description,
+						},
+					},
+				},
+			},
+		}
+		feishuJson, err := json.Marshal(feishuCard)
+		if err != nil {
+			return err
+		}
+		log.Printf("Feishu card JSON: %s", string(feishuJson))
+		botUUID := c.Params("botUUID", defaultBotUUID)
+		feishuWebhookURL := feishuWebhookBase + "/" + botUUID
+		request, err := http.NewRequest("POST", feishuWebhookURL, bytes.NewBuffer(feishuJson))
+		request.Header.Set("Content-Type", "application/json; charset=UTF-8")
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			return err
+		}
+		defer response.Body.Close()
+		body, _ := ioutil.ReadAll(response.Body)
+		log.Printf("Response body: %s", string(body))
+
 		return c.SendStatus(204)
 	})
 
